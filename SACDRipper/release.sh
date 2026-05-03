@@ -154,6 +154,17 @@ rsync -av --delete \
     "$SITE_DIR/dist/" \
     "${PUBLISH_HOST}:${PUBLISH_PATH}/"
 
+echo "==> Creating GitHub release v${VERSION}..."
+# Mirrors the same zip as a GitHub Release asset so users can pull from
+# github.com/prietus/sacd-extract/releases as well as the marketing site.
+# --latest marks this as the current release. Fails loudly if v$VERSION
+# already exists, which is the right behaviour — don't silently
+# overwrite a published tag.
+gh release create "v${VERSION}" "$ZIP_OUT" \
+    --title "SACDRipper ${VERSION}" \
+    --latest \
+    --notes "Download: [\`SACDRipper-${VERSION}.zip\`](https://github.com/prietus/sacd-extract/releases/download/v${VERSION}/SACDRipper-${VERSION}.zip) · Mirror: https://sacdripper.priet.us"
+
 echo "==> Pinging IndexNow (Bing, Yandex, Seznam, Naver)..."
 ssh "$PUBLISH_HOST" "~/indexnow.sh https://sacdripper.priet.us/" || \
     echo "WARN: IndexNow ping failed (release still published)."
