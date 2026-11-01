@@ -23,8 +23,8 @@ SIGN_ID="Developer ID Application: carlos prieto ortiz ($TEAM_ID)"
 KEYCHAIN_PROFILE="notarytool-profile"
 
 SITE_DIR="/Users/carlos/sacdripper-site"
-PUBLISH_HOST="teraflops@192.168.1.37"
-PUBLISH_PATH="/home/teraflops/sacdripper-site"
+PUBLISH_HOST="teraflops@mail.priet.us"
+PUBLISH_PATH="/srv/sites/sacdripper-site"
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DERIVED="/tmp/SACDRipper-build"
@@ -32,6 +32,25 @@ APP_OUT="/tmp/SACDRipper.app"
 ZIP_OUT="/tmp/SACDRipper-${VERSION}.zip"
 
 cd "$PROJECT_DIR"
+
+if [ "$PUBLISH" = "1" ]; then
+    # Fail before building/uploading anything, not after the site is live.
+    echo "==> Pre-flight checks for publishing..."
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+        echo "ERROR: working tree has uncommitted changes; commit them first." >&2
+        exit 1
+    fi
+    git fetch --quiet
+    if [ "$(git rev-parse HEAD)" != "$(git rev-parse '@{u}')" ]; then
+        echo "ERROR: HEAD is not in sync with $(git rev-parse --abbrev-ref '@{u}'); push (or pull) first." >&2
+        exit 1
+    fi
+    if gh release view "v${VERSION}" >/dev/null 2>&1; then
+        echo "ERROR: GitHub release v${VERSION} already exists." >&2
+        exit 1
+    fi
+fi
+RELEASE_COMMIT="$(git rev-parse HEAD)"
 
 echo "==> Ensuring vendored sacd_extract is present..."
 "$PROJECT_DIR/../scripts/bootstrap.sh"
@@ -56,7 +75,7 @@ xcodebuild \
     ENABLE_HARDENED_RUNTIME=YES \
     OTHER_CODE_SIGN_FLAGS="--timestamp --options=runtime" \
     build \
-    | grep -E "^(===|warning:|error:|\*\*)" || true
+    | grep -E "(error|warning):|^\*\*" || true
 
 BUILT_APP="$DERIVED/Build/Products/Release/SACDRipper.app"
 if [ ! -d "$BUILT_APP" ]; then
@@ -161,6 +180,7 @@ echo "==> Creating GitHub release v${VERSION}..."
 # already exists, which is the right behaviour — don't silently
 # overwrite a published tag.
 gh release create "v${VERSION}" "$ZIP_OUT" \
+    --target "$RELEASE_COMMIT" \
     --title "SACDRipper ${VERSION}" \
     --latest \
     --notes "Download: [\`SACDRipper-${VERSION}.zip\`](https://github.com/prietus/sacd-extract/releases/download/v${VERSION}/SACDRipper-${VERSION}.zip) · Mirror: https://sacdripper.priet.us"
