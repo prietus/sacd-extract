@@ -331,8 +331,8 @@ struct RipView: View {
 
     private var sourceIcon: String {
         switch controller.sourceStatus {
-        case .netReady, .netConnected, .netProbing, .netUnreachable: return "network"
-        case .fileReady, .fileScanning, .fileMissing: return "doc"
+        case .netReady, .netConnected, .netProbing, .netUnreachable, .netNoDisc: return "network"
+        case .fileReady, .fileScanning, .fileMissing, .fileNoDisc: return "doc"
         case .invalid: return "exclamationmark.triangle"
         case .idle: return "arrow.down.doc"
         }

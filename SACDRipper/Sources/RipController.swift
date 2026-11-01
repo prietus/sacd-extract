@@ -82,12 +82,14 @@ enum SourceStatus: Equatable {
     case idle
     case invalid(String)
     case fileMissing
-    case fileReady(URL, DiscInfo?)
+    case fileReady(URL, DiscInfo)
     case fileScanning(URL)
     case netProbing(String)
     case netUnreachable(String)
     case netConnected(String)
-    case netReady(String, DiscInfo?)
+    case netReady(String, DiscInfo)
+    case fileNoDisc(URL, String?)
+    case netNoDisc(String, String?)
 
     var headline: String {
         switch self {
@@ -95,26 +97,28 @@ enum SourceStatus: Equatable {
         case .invalid(let msg): return "Invalid input · \(msg)"
         case .fileMissing: return "File not found"
         case .fileScanning(let url): return "Scanning \(url.lastPathComponent)…"
-        case .fileReady(let url, let info):
-            if let info { return info.headline }
-            return url.lastPathComponent
+        case .fileReady(_, let info): return info.headline
+        case .fileNoDisc: return "Not a readable SACD image"
         case .netProbing(let addr): return "Connecting to \(addr)…"
         case .netUnreachable(let addr): return "Cannot reach \(addr)"
         case .netConnected(let addr): return "Connected to \(addr) · looking for disc…"
-        case .netReady(_, let info):
-            if let info { return info.headline }
-            return "SACD detected"
+        case .netReady(_, let info): return info.headline
+        case .netNoDisc(let addr, _): return "No SACD found at \(addr)"
         }
     }
 
     var detail: String? {
         switch self {
         case .fileReady(let url, let info):
-            if let info, let n = info.trackCount { return "\(url.lastPathComponent) · \(n) tracks · ready to rip" }
-            return url.path
+            if let n = info.trackCount { return "\(url.lastPathComponent) · \(n) tracks · ready to rip" }
+            return "\(url.lastPathComponent) · ready to rip"
         case .netReady(let addr, let info):
-            if let info, let n = info.trackCount { return "\(addr) · \(n) tracks · ready to rip" }
+            if let n = info.trackCount { return "\(addr) · \(n) tracks · ready to rip" }
             return "\(addr) · ready to rip"
+        case .fileNoDisc(let url, let reason):
+            return reason ?? url.path
+        case .netNoDisc(_, let reason):
+            return reason ?? "The server answered but reported no disc. Check that an SACD is loaded."
         case .netConnected(let addr): return addr
         case .fileScanning(let url): return url.path
         default: return nil
@@ -133,6 +137,7 @@ enum SourceStatus: Equatable {
         switch self {
         case .idle: return .secondary
         case .invalid, .fileMissing, .netUnreachable: return .red
+        case .fileNoDisc, .netNoDisc: return .orange
         case .fileScanning, .netProbing, .netConnected: return .yellow
         case .fileReady, .netReady: return .green
         }
@@ -141,7 +146,8 @@ enum SourceStatus: Equatable {
     var icon: String {
         switch self {
         case .idle: return "tray"
-        case .invalid, .fileMissing: return "exclamationmark.triangle"
+        case .invalid, .fileMissing, .fileNoDisc: return "exclamationmark.triangle"
+        case .netNoDisc: return "opticaldiscdrive"
         case .netUnreachable: return "wifi.exclamationmark"
         case .fileScanning: return "doc.text.magnifyingglass"
         case .netProbing: return "antenna.radiowaves.left.and.right"
@@ -229,20 +235,57 @@ private final class TCPProbeState: @unchecked Sendable {
     }
 }
 
+private enum ProbeResult {
+    case disc(DiscInfo)
+    /// sacd_extract ran but found no readable SACD; carries its last
+    /// stderr line when there is one ("Can't open …", "connection refused").
+    case noDisc(String?)
+}
+
 private final class ProbeDiscState: @unchecked Sendable {
-    private let continuation: CheckedContinuation<DiscInfo?, Never>
+    private let continuation: CheckedContinuation<ProbeResult, Never>
     private let lock = NSLock()
     private var done = false
 
-    init(_ continuation: CheckedContinuation<DiscInfo?, Never>) {
+    init(_ continuation: CheckedContinuation<ProbeResult, Never>) {
         self.continuation = continuation
     }
 
-    func finish(_ v: DiscInfo?) {
+    func finish(_ v: ProbeResult) {
         lock.lock(); defer { lock.unlock() }
         guard !done else { return }
         done = true
         continuation.resume(returning: v)
+    }
+}
+
+/// Splits a byte stream on \n / \r. Works on raw bytes so a multi-byte
+/// UTF-8 character straddling two reads (Japanese album titles, accents)
+/// is never dropped; decoding is lossy rather than failing the whole chunk.
+private struct LineSplitter {
+    private var buffer = Data()
+
+    mutating func feed(_ data: Data) -> [String] {
+        buffer.append(data)
+        var lines: [String] = []
+        var start = buffer.startIndex
+        var i = start
+        while i < buffer.endIndex {
+            let b = buffer[i]
+            if b == 0x0A || b == 0x0D {
+                if i > start { lines.append(String(decoding: buffer[start..<i], as: UTF8.self)) }
+                start = buffer.index(after: i)
+            }
+            i = buffer.index(after: i)
+        }
+        buffer = Data(buffer[start...])
+        if buffer.count > 4096 { lines += flush() }
+        return lines
+    }
+
+    mutating func flush() -> [String] {
+        defer { buffer = Data() }
+        return buffer.isEmpty ? [] : [String(decoding: buffer, as: UTF8.self)]
     }
 }
 
@@ -252,15 +295,25 @@ final class RipController: ObservableObject {
     @Published var inputPath: String = "" {
         didSet { if inputPath != oldValue && !isRunning { scheduleProbe() } }
     }
-    @Published var outputDir: String = (NSSearchPathForDirectoriesInDomains(.downloadsDirectory, .userDomainMask, true).first ?? NSHomeDirectory())
-    @Published var format: RipFormat = .dsf
-    @Published var channels: RipChannels = .stereo
-    @Published var convertDSTtoDSD: Bool = true
-    @Published var exportCUE: Bool = false
-    @Published var includePauses: Bool = false
-    @Published var dsfNoPad: Bool = false
-    @Published var artistInFolder: Bool = false
-    @Published var performerInFile: Bool = false
+    // Persisted across launches. Per-disc settings (tracks, concatenate,
+    // print-only) deliberately are not.
+    @Published var outputDir: String = Prefs.string("outputDir")
+        ?? NSSearchPathForDirectoriesInDomains(.downloadsDirectory, .userDomainMask, true).first
+        ?? NSHomeDirectory() {
+        didSet { Prefs.set(outputDir, "outputDir") }
+    }
+    @Published var format: RipFormat = Prefs.string("format").flatMap(RipFormat.init) ?? .dsf {
+        didSet { Prefs.set(format.rawValue, "format") }
+    }
+    @Published var channels: RipChannels = Prefs.string("channels").flatMap(RipChannels.init) ?? .stereo {
+        didSet { Prefs.set(channels.rawValue, "channels") }
+    }
+    @Published var convertDSTtoDSD: Bool = Prefs.bool("convertDSTtoDSD", true) { didSet { Prefs.set(convertDSTtoDSD, "convertDSTtoDSD") } }
+    @Published var exportCUE: Bool = Prefs.bool("exportCUE", false) { didSet { Prefs.set(exportCUE, "exportCUE") } }
+    @Published var includePauses: Bool = Prefs.bool("includePauses", false) { didSet { Prefs.set(includePauses, "includePauses") } }
+    @Published var dsfNoPad: Bool = Prefs.bool("dsfNoPad", false) { didSet { Prefs.set(dsfNoPad, "dsfNoPad") } }
+    @Published var artistInFolder: Bool = Prefs.bool("artistInFolder", false) { didSet { Prefs.set(artistInFolder, "artistInFolder") } }
+    @Published var performerInFile: Bool = Prefs.bool("performerInFile", false) { didSet { Prefs.set(performerInFile, "performerInFile") } }
     @Published var printOnly: Bool = false
     @Published var concatenate: Bool = false
     @Published var trackSelection: String = ""
@@ -295,9 +348,10 @@ final class RipController: ObservableObject {
 
     // MARK: Internals
     private var process: Process?
+    /// Stop pressed while start() was still waiting for the probe to exit.
+    private var startCancelled = false
     private var probeTask: Task<Void, Never>?
-    private weak var activeProbeProcess: Process?
-    private var readBuffer: String = ""
+    private var activeProbeProcess: Process?
 
     private static let reCompleted = try! NSRegularExpression(pattern: #"Completed:\s*(\d+)%"#)
     private static let reTotal = try! NSRegularExpression(pattern: #"Total:\s*(\d+)%"#)
@@ -443,9 +497,12 @@ final class RipController: ObservableObject {
                 return
             }
             sourceStatus = .fileScanning(url)
-            let info = await probeDisc(args: ["-P", "-i", url.path])
+            let result = await probeDisc(args: ["-P", "-i", url.path])
             if Task.isCancelled { return }
-            sourceStatus = .fileReady(url, info)
+            switch result {
+            case .disc(let info): sourceStatus = .fileReady(url, info)
+            case .noDisc(let reason): sourceStatus = .fileNoDisc(url, reason)
+            }
         case .network(let host, let port):
             let addr = "\(host):\(port)"
             sourceStatus = .netProbing(addr)
@@ -453,9 +510,12 @@ final class RipController: ObservableObject {
             if Task.isCancelled { return }
             if !reachable { sourceStatus = .netUnreachable(addr); return }
             sourceStatus = .netConnected(addr)
-            let info = await probeDisc(args: ["-P", "-i", addr], timeoutSec: 12)
+            let result = await probeDisc(args: ["-P", "-i", addr], timeoutSec: 12)
             if Task.isCancelled { return }
-            sourceStatus = .netReady(addr, info)
+            switch result {
+            case .disc(let info): sourceStatus = .netReady(addr, info)
+            case .noDisc(let reason): sourceStatus = .netNoDisc(addr, reason)
+            }
         }
     }
 
@@ -476,11 +536,10 @@ final class RipController: ObservableObject {
         }
     }
 
-    private func probeDisc(args: [String], timeoutSec: TimeInterval = 10) async -> DiscInfo? {
-        guard let binary = binaryPath else { return nil }
-        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary)
+    private func probeDisc(args: [String], timeoutSec: TimeInterval = 10) async -> ProbeResult {
+        guard let binary = binaryPath else { return .noDisc("sacd_extract binary not found in app bundle") }
 
-        return await withCheckedContinuation { (cont: CheckedContinuation<DiscInfo?, Never>) in
+        return await withCheckedContinuation { (cont: CheckedContinuation<ProbeResult, Never>) in
             let state = ProbeDiscState(cont)
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: binary)
@@ -490,20 +549,31 @@ final class RipController: ObservableObject {
             proc.standardOutput = out
             proc.standardError = err
 
-            proc.terminationHandler = { _ in
-                let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
-                let text = String(data: data, encoding: .utf8) ?? ""
-                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                state.finish(trimmed.isEmpty ? nil : DiscInfo(raw: trimmed))
+            proc.terminationHandler = { p in
+                let outText = String(decoding: (try? out.fileHandleForReading.readToEnd()) ?? Data(), as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                // sacd_extract exits 255 with empty stdout when the input
+                // isn't a readable SACD (missing file, junk ISO, refused
+                // connection, empty tray) — don't call that "ready".
+                if p.terminationStatus == 0, !outText.isEmpty {
+                    state.finish(.disc(DiscInfo(raw: outText)))
+                    return
+                }
+                let errText = String(decoding: (try? err.fileHandleForReading.readToEnd()) ?? Data(), as: UTF8.self)
+                let reason = errText
+                    .components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .first(where: { !$0.isEmpty })
+                state.finish(.noDisc(reason))
             }
 
             do {
                 try proc.run()
             } catch {
-                state.finish(nil)
+                state.finish(.noDisc(error.localizedDescription))
                 return
             }
-            Task { @MainActor [weak self] in self?.activeProbeProcess = proc }
+            activeProbeProcess = proc
 
             DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSec) {
                 if proc.isRunning { proc.terminate() }
@@ -547,16 +617,33 @@ final class RipController: ObservableObject {
             phase = .failed(message: "Input not set", exitCode: -1)
             return
         }
-        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary)
         if !outputDir.isEmpty {
             try? FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
         }
+
+        // The sacd-ripper server only handles one client at a time, so a
+        // `-P` probe that is still connected must be fully gone before the
+        // rip opens its own connection — terminate() alone is asynchronous.
+        let pendingProbe = activeProbeProcess
         cancelActiveProbe()
         resetRipState()
         phase = .starting
         startDate = Date()
+        isRunning = true
+        startCancelled = false
 
         let args = buildArgs()
+        Task { [weak self] in
+            await Self.waitForExit(pendingProbe, timeout: 3)
+            self?.launch(binary: binary, args: args)
+        }
+    }
+
+    private func launch(binary: String, args: [String]) {
+        if startCancelled {
+            finishRun(exitCode: SIGINT)
+            return
+        }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binary)
@@ -565,36 +652,87 @@ final class RipController: ObservableObject {
         proc.standardOutput = pipe
         proc.standardError = pipe
 
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty { return }
-            if let str = String(data: data, encoding: .utf8) {
-                Task { @MainActor [weak self] in self?.consume(str) }
-            }
-        }
-
-        proc.terminationHandler = { [weak self] p in
-            pipe.fileHandleForReading.readabilityHandler = nil
-            Task { @MainActor [weak self] in self?.finishRun(exitCode: p.terminationStatus) }
-        }
+        let exited = DispatchGroup()
+        exited.enter()
+        proc.terminationHandler = { _ in exited.leave() }
 
         do {
             try proc.run()
-            process = proc
-            isRunning = true
         } catch {
+            isRunning = false
             phase = .failed(message: error.localizedDescription, exitCode: -1)
+            return
+        }
+        // Drop our copy of the write end so the reader sees EOF once the
+        // child exits.
+        try? pipe.fileHandleForWriting.close()
+        process = proc
+
+        // One serial reader drains the pipe to EOF, so every byte — including
+        // the final error / [elapsed] lines — is processed, in order, before
+        // finishRun runs.
+        let reader = pipe.fileHandleForReading
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var splitter = LineSplitter()
+            while true {
+                let data = reader.availableData
+                if data.isEmpty { break }
+                let lines = splitter.feed(data)
+                if !lines.isEmpty {
+                    DispatchQueue.main.async { self?.processLines(lines) }
+                }
+            }
+            let rest = splitter.flush()
+            exited.wait()
+            let code = proc.terminationStatus
+            DispatchQueue.main.async {
+                self?.processLines(rest)
+                self?.finishRun(exitCode: code)
+            }
         }
     }
 
     func stop() {
-        process?.interrupt()
+        if let process {
+            process.interrupt()
+        } else if isRunning {
+            startCancelled = true
+        }
+    }
+
+    /// Called when the app quits mid-rip: an orphaned sacd_extract would keep
+    /// holding the player's single client slot. Blocks briefly on purpose.
+    func terminateForQuit() {
+        cancelActiveProbe()
+        guard let p = process, p.isRunning else { return }
+        p.interrupt()
+        if Self.blockingWait(p, timeout: 3) { return }
+        p.terminate()
+        if Self.blockingWait(p, timeout: 2) { return }
+        kill(p.processIdentifier, SIGKILL)
+    }
+
+    private static func waitForExit(_ p: Process?, timeout: TimeInterval) async {
+        guard let p else { return }
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if p.isRunning {
+            kill(p.processIdentifier, SIGKILL)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+    }
+
+    private static func blockingWait(_ p: Process, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning && Date() < deadline { usleep(50_000) }
+        return !p.isRunning
     }
 
     func clearTail() { tail = [] }
 
     private func resetRipState() {
-        readBuffer = ""
         filePercent = 0
         totalPercent = nil
         currentTrack = nil
@@ -634,18 +772,8 @@ final class RipController: ObservableObject {
         return nil
     }
 
-    // Consume stdout chunks, split on \r or \n, forward to processLine
-    private func consume(_ chunk: String) {
-        readBuffer.append(chunk)
-        while let idx = readBuffer.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
-            let line = String(readBuffer[readBuffer.startIndex..<idx])
-            readBuffer = String(readBuffer[readBuffer.index(after: idx)...])
-            if !line.isEmpty { processLine(line) }
-        }
-        if readBuffer.count > 4096 {
-            processLine(readBuffer)
-            readBuffer = ""
-        }
+    private func processLines(_ lines: [String]) {
+        for line in lines { processLine(line) }
     }
 
     private func processLine(_ rawLine: String) {
@@ -695,4 +823,12 @@ final class RipController: ObservableObject {
             tail.removeFirst(tail.count - 60)
         }
     }
+}
+
+/// Thin UserDefaults wrapper for the persisted rip settings.
+private enum Prefs {
+    private static let d = UserDefaults.standard
+    static func string(_ key: String) -> String? { d.string(forKey: key) }
+    static func bool(_ key: String, _ fallback: Bool) -> Bool { d.object(forKey: key) as? Bool ?? fallback }
+    static func set(_ value: Any, _ key: String) { d.set(value, forKey: key) }
 }

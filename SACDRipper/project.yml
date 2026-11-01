@@ -28,6 +28,7 @@ targets:
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
         INFOPLIST_KEY_CFBundleDisplayName: SACD Ripper
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "SACD Ripper connects to your Blu-ray player or PS3 on the local network to read SACD discs, and can scan your subnet to find it."
         MACOSX_DEPLOYMENT_TARGET: "13.0"
         ENABLE_HARDENED_RUNTIME: NO
         ENABLE_APP_SANDBOX: NO

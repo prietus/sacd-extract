@@ -25,8 +25,9 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable {
 
 struct ContentView: View {
     @State private var selection: AppSection = .rip
-    @StateObject private var ripController = RipController()
-    @StateObject private var fixController = FixISOController()
+    // Owned by the AppDelegate so quitting can stop a running rip.
+    @ObservedObject var ripController: RipController
+    @ObservedObject var fixController: FixISOController
 
     var body: some View {
         NavigationSplitView {
